@@ -1,0 +1,4 @@
+director:
+  image: creep/director
+  environment:
+    - AMQP_URL=amqp://mqadmin:mqadmin@dev-rabbit-1.lan.smclinic.ru:5672//
