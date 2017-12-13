@@ -28,7 +28,7 @@ function consumeMessage (message, callback1, callback2) {
             })
 
             request('POST',
-              'http://action-scripter:8081/webhook/' + arrayItem.actionId + '?' + paramString,
+              process.env.ACTION_SCRIPTER_URL + arrayItem.actionId + '?' + paramString,
               {body: lastItemResult}
             ).getBody('utf8')
             .done(function (res) {
@@ -102,7 +102,7 @@ function publish (content, objectType, callback) {
         pubChannel = ch
         objectType.destinations.forEach(function (objectItem, i, arr) {
           request('POST',
-            'http://splitter:8082/' + objectItem.split,
+            process.env.SPLITTER_URL + objectItem.split,
             {body: content.content.toString()}
           ).getBody('utf8')
           .done(function (res) {
@@ -120,7 +120,7 @@ function publish (content, objectType, callback) {
     } else {
       objectType.destinations.forEach(function (objectItem, i, arr) {
         request('POST',
-          'http://splitter:8082/' + objectItem.split,
+          process.env.SPLITTER_URL + objectItem.split,
           {body: content.content.toString()}
         ).getBody('utf8')
         .done(function (res) {
@@ -204,7 +204,7 @@ function start () {
 }
 
 function whenConnected () {
-  mongoose.connect('mongodb://mongo:27017/local', function (err) {
+  mongoose.connect(process.env.MONGO_URL, function (err) {
     if (err) {
       console.error('[mongo]', err.message)
     }
@@ -219,9 +219,9 @@ function whenConnected () {
 start()
 
 function logDestinationAdded (correlationId, systemId, newMessageUid) {
-  request('GET', 'http://logger:8084/destinationAdded/' + correlationId + '/' + systemId + '/' + newMessageUid + '/' + Date.now())
+  request('GET', process.env.LOGGER_URL + 'destinationAdded/' + correlationId + '/' + systemId + '/' + newMessageUid + '/' + Date.now())
 }
 
 function logDirectorStart (correlationId) {
-  request('GET', 'http://logger:8084/update/' + correlationId + '/timeDirectorStart/' + Date.now())
+  request('GET', process.env.LOGGER_URL + 'update/' + correlationId + '/timeDirectorStart/' + Date.now())
 }
