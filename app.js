@@ -20,6 +20,31 @@ function getObjectsToTransmit () {
     if (result) {
       objectsToTransmit = result.objectTypes
       userId = result.userId
+      globals.elastic.indices.create({
+        index: userId,
+        body: {}
+      }, function (error, response) {
+        if (error) {
+          console.log('[ELASTIC ERROR] ' + error)
+        }
+      })
+      objectsToTransmit.forEach(function (objectType, i, arr) {
+        globals.elastic.indices.putMapping({
+          index: userId,
+          type: objectType.objectId,
+          body: {
+            properties: {
+              timestamp: {
+                type: 'date'
+              }
+            }
+          }
+        }, function (error, response) {
+          if (error) {
+            console.log('[ELASTIC ERROR] ' + error)
+          }
+        })
+      })
     } else {
       console.error('[mongo]', 'Wrong system id')
       return setTimeout(start, 1000)
