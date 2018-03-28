@@ -1,26 +1,93 @@
+var globals = require('./include/globals.js')
+var jsonpath = require('jsonpath')
 var mongoose = require('mongoose')
+var redis = require('redis')
 var amqp = require('amqplib/callback_api')
 var waterfall = require('async-waterfall')
 var request = require('then-request')
-const uuidv4 = require('uuid/v1')
-var amqpConn = null
-var consumeChannel = null
-var pubChannel = null
-var systemCollection = null
+var elasticsearch = require('elasticsearch')
+const uuidv5 = require('uuid/v5')
+const uuidv4 = require('uuid/v4')
+const uuidv1 = require('uuid/v1')
 var objectsToTransmit = null
+var userId = null
 
-function consumeMessage (message, callback1, callback2) {
-  var messageString = message.content.toString()
+function getObjectsToTransmit () {
+  globals.systemCollection.findOne({ systemId: process.env.SYSTEM_ID }, function (err, result) {
+    if (err) {
+      console.error(err.message)
+    }
+    if (result) {
+      objectsToTransmit = result.objectTypes
+      userId = result.userId
+    } else {
+      console.error('[mongo]', 'Wrong system id')
+      return setTimeout(start, 1000)
+    }
+  })
+}
+
+function consumeMessage (originalMessage) {
+  var messageString = originalMessage.content.toString()
   var foundSomething = false
-  logDirectorStart(message.properties.correlationId)
-  objectsToTransmit.forEach(function (item, i, arr) {
-    if (item.objectId === message.fields.routingKey) {
+  logDirectorStart(originalMessage.properties.correlationId)
+
+  objectsToTransmit.forEach(function (objectType, i, arr) {
+    if (objectType.objectId === originalMessage.fields.routingKey) {
       foundSomething = true
-      if ('preloadActions' in item) {
+      // send to elasticsearch to analyze
+      if ('analyzer' in objectType) {
+        var messageObject = JSON.parse(messageString)
+        var analyticsId = originalMessage.properties.correlationId
+        var analyticsType = objectType.objectId
+        var analyticsObject = {
+          timestamp: Date.now(),
+          filters: {},
+          values: {}
+        }
+
+        if ('typeField' in objectType.analyzer) {
+          analyticsType = messageObject[objectType.analyzer.typeField]
+        }
+
+        if ('idField' in objectType.analyzer) {
+          analyticsId = messageObject[objectType.analyzer.idField]
+        }
+
+        if ('timeField' in objectType.analyzer) {
+          analyticsObject.timestamp = messageObject[objectType.analyzer.timeField]
+        }
+
+        if ('filters' in objectType.analyzer) {
+          objectType.analyzer.filters.forEach(function (filterField, i, arr) {
+            analyticsObject.filters[filterField] = messageObject[filterField]
+          })
+        }
+
+        if ('values' in objectType.analyzer) {
+          objectType.analyzer.values.forEach(function (valueField, i, arr) {
+            analyticsObject.values[valueField] = messageObject[valueField]
+          })
+        }
+
+        globals.elastic.index({
+          index: userId,
+          type: analyticsType,
+          id: analyticsId,
+          body: analyticsObject
+        }, function (error, response) {
+          if (error) {
+            console.log('[ELASTIC ERROR] ' + error)
+          }
+        })
+      }
+
+      globals.multi[originalMessage.properties.correlationId] = globals.redisClient.multi()
+      if ('preloadActions' in objectType) {
         waterfall([function initializer (firstMapFunction) {
           var initialValue = messageString
           firstMapFunction(null, initialValue)
-        }].concat(item.preloadActions.map(function (arrayItem) {
+        }].concat(objectType.preloadActions.map(function (arrayItem) {
           return function (lastItemResult, nextCallback) {
             var paramString = ''
             arrayItem.actionParameters.forEach(function (item, i, arr) {
@@ -39,141 +106,139 @@ function consumeMessage (message, callback1, callback2) {
           if (err) {
             console.error(err.message)
           }
-          console.log('[RESULT AFTER ALL ACTIONS]')
-          message.content = Buffer.from(result)
-          callback1(message, item, callback2)
+          publish(originalMessage, result, objectType)
         })
       } else {
-        callback1(message, item, callback2)
+        publish(originalMessage, originalMessage.content.toString(), objectType)
       }
     }
   })
   if (!foundSomething) {
     console.log('[ACKING]')
-    consumeChannel.ack(message)
+    globals.consumeChannel.ack(originalMessage)
   }
 }
 
-function getObjectsToTransmit () {
-  systemCollection.findOne({ systemId: process.env.SYSTEM_ID }, function (err, result) {
-    if (err) {
-      console.error(err.message)
-    }
-    if (result) {
-      objectsToTransmit = result.objectTypes
+function publish (originalMessage, messageAfterActions, objectType) {
+  var destinationsTotal = objectType.destinations.length
+  var destinationsDone = 0
+  globals.destinations = []
+  objectType.destinations.forEach(function (objectItem, i, arr) {
+    var shouldBeRouted = true
+    if ('routeCondition' in objectItem && objectItem.routeCondition !== '') {
+      var elements = jsonpath.query(JSON.parse(originalMessage.content.toString()), objectItem.routeCondition)
+      shouldBeRouted = (elements.length > 0)
+      console.log('[CHECKING ROUTE CONDITION] ' + shouldBeRouted)
     } else {
-      console.error('[mongo]', 'Wrong system id')
-      process.exit(1)
+      console.log('[NO CHECKING ROUTE CONDITION]')
+    }
+    if (shouldBeRouted) {
+      request('POST',
+        process.env.SPLITTER_URL + objectItem.split,
+        {body: messageAfterActions}
+      ).getBody('utf8')
+      .done(function (messageAfterSplitter) {
+        destinationsDone++
+        var lastDestination = false
+        if (destinationsDone === destinationsTotal) {
+          lastDestination = true
+        }
+        if (messageAfterSplitter[0] === '[') {
+          const messageArray = JSON.parse(messageAfterSplitter)
+          messageArray.forEach(function (item, i, arr) {
+            var lastSplitted = false
+            if (lastDestination && i === (arr.length - 1)) {
+              lastSplitted = true
+            }
+            publishToChannel(objectItem.systemId + '.outgoing', JSON.stringify(item), originalMessage, lastSplitted)
+          })
+        } else {
+          publishToChannel(objectItem.systemId + '.outgoing', messageAfterSplitter, originalMessage, lastDestination)
+        }
+      })
+    } else {
+      destinationsDone++
+      if (destinationsDone === destinationsTotal) {
+        globals.multi[originalMessage.properties.correlationId].exec(function (err, replies) {
+          if (err) {
+            console.error('[REDIS publish] error ', err)
+            globals.multi[originalMessage.properties.correlationId].discard()
+            globals.multi[originalMessage.properties.correlationId] = null
+          } else {
+            console.log('[ACKING] ' + originalMessage.properties.correlationId)
+            globals.consumeChannel.ack(originalMessage)
+            globals.multi[originalMessage.properties.correlationId] = null
+            globals.destinations.forEach(function (objectItem, i, arr) {
+              logDestinationAdded(originalMessage.properties.correlationId, objectItem.name, objectItem.messageUid)
+            })
+          }
+        })
+      }
     }
   })
 }
 
-function publishToChannel (queueName, content, correlationId) {
-  const newMessageUid = uuidv4()
-  console.log('[PUBLISHING] ' + queueName)
-  pubChannel.assertQueue(queueName)
-  pubChannel.sendToQueue(queueName, content, { correlationId: correlationId, messageId: newMessageUid },
-                    function (err, ok) {
-                      if (err) {
-                        console.error('[AMQP publish] publish', err)
-                        pubChannel.connection.close()
-                      }
-
-                      logDestinationAdded(correlationId, queueName.replace('.outgoing', ''), newMessageUid)
-                    })
-}
-
-function publish (content, objectType, callback) {
-  try {
-    if (!pubChannel) {
-      amqpConn.createConfirmChannel(function (err, ch) {
-        if (err) {
-          console.error('[AMQP publish]', err.message)
-          return setTimeout(start, 1000)
-        }
-        ch.on('error', function (err) {
-          console.error('[AMQP publish] channel error', err.message)
+function publishToChannel (queueName, messageAfterActions, originalMessage, lastDestination) {
+  const newMessageUid = uuidv5(uuidv4(), uuidv1())
+  globals.multi[originalMessage.properties.correlationId]
+    .hmset(newMessageUid,
+       'message', messageAfterActions,
+       'correlationId', originalMessage.properties.correlationId,
+       'queue', queueName,
+       'publishTime', originalMessage.properties.timestamp)
+    .zadd(queueName, originalMessage.properties.timestamp, newMessageUid)
+  globals.destinations.push({ name: queueName.replace('.outgoing', ''), messageUid: newMessageUid })
+  if (lastDestination) {
+    globals.multi[originalMessage.properties.correlationId].exec(function (err, replies) {
+      if (err) {
+        console.error('[REDIS publish] error ', err)
+        globals.multi[originalMessage.properties.correlationId].discard()
+        globals.multi[originalMessage.properties.correlationId] = null
+      } else {
+        console.log('[ACKING] ' + originalMessage.properties.correlationId)
+        globals.consumeChannel.ack(originalMessage)
+        globals.multi[originalMessage.properties.correlationId] = null
+        globals.destinations.forEach(function (objectItem, i, arr) {
+          logDestinationAdded(originalMessage.properties.correlationId, objectItem.name, objectItem.messageUid)
         })
-        ch.on('close', function () {
-          console.log('[AMQP publish] channel closed')
-          pubChannel = null
-        })
-
-        pubChannel = ch
-        objectType.destinations.forEach(function (objectItem, i, arr) {
-          request('POST',
-            process.env.SPLITTER_URL + objectItem.split,
-            {body: content.content.toString()}
-          ).getBody('utf8')
-          .done(function (res) {
-            if (res[0] === '[') {
-              const messageArray = JSON.parse(res)
-              messageArray.forEach(function (item, i, arr) {
-                publishToChannel(objectItem.systemId + '.outgoing', Buffer.from(JSON.stringify(item)), content.properties.correlationId)
-              })
-            } else {
-              publishToChannel(objectItem.systemId + '.outgoing', content.content, content.properties.correlationId)
-            }
-          })
-        })
-      })
-    } else {
-      objectType.destinations.forEach(function (objectItem, i, arr) {
-        request('POST',
-          process.env.SPLITTER_URL + objectItem.split,
-          {body: content.content.toString()}
-        ).getBody('utf8')
-        .done(function (res) {
-          if (res[0] === '[') {
-            const messageArray = JSON.parse(res)
-            messageArray.forEach(function (item, i, arr) {
-              publishToChannel(objectItem.systemId + '.outgoing', Buffer.from(JSON.stringify(item)), content.properties.correlationId)
-            })
-          } else {
-            publishToChannel(objectItem.systemId + '.outgoing', content.content, content.properties.correlationId)
-          }
-        })
-      })
-    }
-  } catch (e) {
-    console.error('[AMQP publish]', e.message)
+      }
+    })
   }
-  console.log('[ACKING]')
-  consumeChannel.ack(content)
 }
 
 function consumer () {
   try {
-    if (!consumeChannel) {
-      amqpConn.createConfirmChannel(function (err, ch) {
+    if (!globals.consumeChannel) {
+      globals.amqpConn.createConfirmChannel(function (err, ch) {
         if (err) {
           console.error('[AMQP consume]', err.message)
           return setTimeout(start, 1000)
         }
         ch.on('error', function (err) {
           console.error('[AMQP consume] channel error', err.message)
+          process.exit(1)
         })
         ch.on('close', function () {
           console.log('[AMQP consume] channel closed')
-          consumeChannel = null
+          process.exit(1)
         })
 
-        ch.prefetch(100)
+        ch.prefetch(20)
 
-        consumeChannel = ch
-        consumeChannel.assertQueue(process.env.SYSTEM_ID)
-        consumeChannel.consume(process.env.SYSTEM_ID, function (content) {
+        globals.consumeChannel = ch
+        globals.consumeChannel.assertQueue(process.env.SYSTEM_ID)
+        globals.consumeChannel.consume(process.env.SYSTEM_ID, function (content) {
           if (content !== null) {
-            console.log('[NEW MESSAGE TO CONSUME]')
-            consumeMessage(content, publish, consumeChannel.ack)
+            console.log('[NEW MESSAGE TO CONSUME] ' + content.properties.correlationId)
+            consumeMessage(content)
           }
         })
       })
     } else {
-      consumeChannel.consume(process.env.SYSTEM_ID, function (content) {
+      globals.consumeChannel.consume(process.env.SYSTEM_ID, function (content) {
         if (content !== null) {
-          console.log('[NEW MESSAGE TO CONSUME]')
-          consumeMessage(content, publish, consumeChannel.ack)
+          console.log('[NEW MESSAGE TO CONSUME] ' + content.properties.correlationId)
+          consumeMessage(content)
         }
       })
     }
@@ -183,10 +248,15 @@ function consumer () {
 }
 
 function start () {
+  globals.elastic = new elasticsearch.Client({
+    host: process.env.ELASTICSEARCH_URL,
+    log: 'info'
+  })
+
   amqp.connect(process.env.AMQP_URL + '?heartbeat=60', function (err, conn) {
     if (err) {
       console.error('[AMQP connect]', err.message)
-      return setTimeout(start, 1000)
+      process.exit(1)
     }
     conn.on('error', function (err) {
       if (err.message !== 'Connection closing') {
@@ -194,22 +264,28 @@ function start () {
       }
     })
     conn.on('close', function () {
-      console.error('[AMQP connect] reconnecting')
-      return setTimeout(start, 1000)
+      console.error('[AMQP connect] closed')
+      process.exit(1)
     })
     console.log('[AMQP connect] connected')
-    amqpConn = conn
+    globals.amqpConn = conn
     whenConnected()
   })
 }
 
 function whenConnected () {
+  globals.redisClient = redis.createClient(process.env.REDIS_URL)
+  globals.redisClient.on('error', function (err) {
+    console.error('[REDIS] ' + err)
+    return setTimeout(start, 1000)
+  })
   mongoose.connect(process.env.MONGO_URL, function (err) {
     if (err) {
       console.error('[mongo]', err.message)
+      process.exit(1)
     }
 
-    systemCollection = mongoose.connection.db.collection('systems')
+    globals.systemCollection = mongoose.connection.db.collection('systems')
     getObjectsToTransmit()
   })
 
